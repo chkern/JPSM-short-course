@@ -1,0 +1,166 @@
+---
+title: "Introduction to Big Data for Social Science"
+subtitle: "Foundations of Machine Learning"
+author: "Christoph Kern"
+output: html_notebook
+---
+
+## Setup
+
+```{r}
+# install.packages("tidyverse")
+# install.packages("GGally")
+# install.packages("caret")
+# install.packages("pROC")
+```
+
+```{r}
+library(tidyverse)
+library(GGally)
+library(caret)
+library(pROC)
+```
+
+## Data
+
+For this example, we use the census income data set from the UCI ML repository. It contains "a set of reasonably clean records" from the 1994 Census database. The prediction task is to determine whether a person makes over 50K a year.
+
+Source: https://archive.ics.uci.edu/ml/datasets/Census+Income
+
+First, we load the data and assign variable names.
+
+```{r}
+census <- read.csv("census.data", header = FALSE, na.strings = " ?")
+varnames <- read.delim("census.names", header = FALSE, skip = 95)
+names(census) <- as.character(varnames$V1)
+```
+
+Next, we have to clean the factor levels.
+
+```{r}
+cln_levels <- function(x){
+  levels(x) <- make.names(gsub(" ", "", levels(x)))
+  x
+}
+census[, c(2,4,6,7,8,9,14)] <- lapply(census[, c(2,4,6,7,8,9,14)], cln_levels)
+```
+
+In addition, we drop cases with missing values and empty factor levels.
+
+```{r}
+census$capital_gain[census$capital_gain >= 99990] <- NA
+census <- drop_na(census)
+census <- droplevels(census)
+```
+
+We also exclude some variables that we won't use in our models.
+
+```{r}
+census$fnlwgt <- NULL
+census$education <- NULL
+census$native_country <- NULL
+```
+
+Here we rename the factor levels of the outcome variable and print the frequencies of the outcome categories.
+
+```{r}
+levels(census$inc) <- c("under_50K", "over_50K")
+summary(census$inc)
+```
+
+## Train and test set
+
+Next, we want to split the data into a training (80%) and a test (20%) part. We use `createDataPartition()` from `caret` for this task, which samples within the levels of the outcome variable when splitting the data (i.e. creates stratified splits). 
+
+```{r}
+set.seed(92385)
+inTrain <- createDataPartition(census$inc, 
+                               p = .8, 
+                               list = FALSE, 
+                               times = 1)
+census_train <- census[inTrain,]
+census_test <- census[-inTrain,]
+```
+
+Using the training data, we can run some graphical data exploration using the `GGally` package.
+
+```{r, message = FALSE}
+ggpairs(census_train[,c(1,3,11,12)], lower = list(continuous = "cor"))
+```
+
+## Model training
+
+The `train()` function of the `caret` package can be used to call a variety of supervised learning methods and also offers a number of evaluation approaches. For this, we first specify our evaluation method. In the following, we will use 10-fold cross-validation to evaluate the prediction performance of two logistic regression models.
+
+```{r}
+ctrl <- trainControl(method = "cv",
+                     number = 10,
+                     summaryFunction = twoClassSummary,
+                     classProbs = TRUE,
+                     verboseIter = TRUE)
+```
+
+Now we can call `train()`, along with the specification of the model (logistic regression) and the evaluation method (cross-validation).
+
+```{r}
+m1 <- train(inc ~ age + workclass + education_num + sex,
+            data = census_train,
+            method = "glm",
+            trControl = ctrl)
+```
+
+Return the cross-validation results.
+
+```{r}
+m1
+```
+
+Next, we extend the logistic regression model by including all available features and adding quadratic terms for three predictors.
+
+```{r}
+m2 <- train(inc ~ . + I(age^2) + I(education_num^2) + I(hours_per_week^2),
+            data = census_train,
+            method = "glm",
+            trControl = ctrl)
+```
+
+Again, print the cross-validation results.
+
+```{r}
+m2
+```
+
+We could also return the coefficients of the trained model.
+
+```{r}
+summary(m2)
+```
+
+## Prediction and evaluation
+
+Finally, we can asses the performance of the selected/ best model in the previously untouched test data. For this, we create both predicted probabilities and predicted classes (based on the default threshold).
+
+```{r}
+p_m2 <- predict(m2, newdata = census_test, type = "prob")
+c_m2 <- predict(m2, newdata = census_test)
+```
+
+The `pROC` package can be used to calculate ROC-AUCs and plot ROC curves given a vector of predicted probabilities. We first create the `roc` object.
+
+```{r}
+m2_roc <- roc(census_test$inc, p_m2$over_50K)
+m2_roc
+```
+
+This object can be plotted with `ggroc()`, which allows to use `ggplot2` syntax.
+
+```{r}
+ggroc(m2_roc) +
+  geom_segment(aes(x = 1, xend = 0, y = 0, yend = 1), color = "grey", linetype = "dashed")
+```
+
+Lastly, we can use the predicted classes to create a confusion matrix. Note that the following results are dependent on the classification cut-off that is used (e.g., 0.5).
+
+```{r}
+confusionMatrix(c_m2, census_test$inc, mode = "everything", positive = "over_50K")
+```

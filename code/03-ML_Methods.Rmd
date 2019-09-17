@@ -1,0 +1,209 @@
+---
+title: "Introduction to Big Data for Social Science"
+subtitle: "Machine Learning Methods"
+author: "Christoph Kern"
+output: html_notebook
+---
+
+## Setup
+
+```{r}
+# install.packages("tidyverse")
+# install.packages("rpart")
+# install.packages("partykit")
+# install.packages("ranger")
+# install.packages("caret")
+# install.packages("pROC")
+```
+
+```{r}
+library(tidyverse)
+library(rpart)
+library(partykit)
+library(ranger)
+library(caret)
+library(pROC)
+```
+
+## Data
+
+For this example, we (again) use the census income data set from the UCI ML repository. It contains "a set of reasonably clean records" from the 1994 Census database. The prediction task is to determine whether a person makes over 50K a year.
+
+Source: https://archive.ics.uci.edu/ml/datasets/Census+Income
+
+First, we load the data and assign variable names.
+
+```{r}
+census <- read.csv("census.data", header = FALSE, na.strings = " ?")
+varnames <- read.delim("census.names", header = FALSE, skip = 95)
+names(census) <- as.character(varnames$V1)
+```
+
+Next, we have to clean the factor levels.
+
+```{r}
+cln_levels <- function(x){
+  levels(x) <- make.names(gsub(" ", "", levels(x)))
+  x
+}
+census[, c(2,4,6,7,8,9,14)] <- lapply(census[, c(2,4,6,7,8,9,14)], cln_levels)
+```
+
+In addition, we drop cases with missing values and empty factor levels.
+
+```{r}
+census$capital_gain[census$capital_gain >= 99990] <- NA
+census <- drop_na(census)
+census <- droplevels(census)
+```
+
+We also exclude some variables that we won't use in our models.
+
+```{r}
+census$fnlwgt <- NULL
+census$education <- NULL
+census$native_country <- NULL
+```
+
+Here we rename the factor levels of the outcome variable and print the frequencies of the outcome categories.
+
+```{r}
+levels(census$inc) <- c("under_50K", "over_50K")
+summary(census$inc)
+```
+
+## Train and test set
+
+Next, we want to split the data into a training (80%) and a test (20%) part. We use `createDataPartition()` from `caret` for this task, which samples within the levels of the outcome variable when splitting the data (i.e. creates stratified splits). 
+
+```{r}
+set.seed(92385)
+inTrain <- createDataPartition(census$inc, 
+                               p = .8, 
+                               list = FALSE, 
+                               times = 1)
+census_train <- census[inTrain,]
+census_test <- census[-inTrain,]
+```
+
+## CART
+
+As a first model, we grow a classification tree with `rpart`, which follows the CART idea. In this code example, tree size is controlled by the default options (see `?rpart`).
+
+```{r}
+tree1 <- rpart(inc ~ ., data = census_train, 
+               method = "class")
+tree1
+```
+
+Of course, trees are (usually) best represented by a plot. Here we use the `partykit` package to first convert the tree into the party format and then use `plot()` on the new object.
+
+```{r}
+party_tree1 <- as.party(tree1)
+plot(party_tree1, gp = gpar(fontsize = 9))
+```
+
+Lets build a larger tree.
+
+```{r}
+tree2 <- rpart(inc ~ ., data = census_train,
+               control = rpart.control(minsplit = 10, # minimal obs in a node
+                                       minbucket = 3, # minimal obs in any terminal node
+                                       cp = 0.0001, # min improvement through splitting
+                                       maxdepth = 30 # maximum tree depth
+                                       ))
+```
+
+This large tree is likely to overfit and might not generalize well to new data. Therefore, we use `printcp()` and `plotcp()` that help us to determine the best subtree. `Root node error` times `xerror` gives us the estimated test error for each subtree based on cross-validation. 
+
+```{r}
+printcp(tree2)
+plotcp(tree2)
+```
+
+On this basis, we want to choose the cp value that is associated with the smallest CV error. We could do this by hand or by using a few lines of code.
+
+```{r}
+minx <- which.min(tree2$cptable[,"xerror"])
+mincp <- tree2$cptable[minx,"CP"]
+mincp
+```
+
+Now we can get the best subtree with the `prune()` function and save it as our final tree model.
+
+```{r}
+tree3 <- prune(tree2, cp = mincp)
+```
+
+## Random Forest
+
+In order to build a random forest, we again use the `caret` package, which requires to first specify the evaluation method. In the following, we use 5-fold cross-validation.
+
+```{r}
+ctrl <- trainControl(method = "cv",
+                     number = 5,
+                     summaryFunction = twoClassSummary,
+                     classProbs = TRUE,
+                     verboseIter = TRUE)
+```
+
+We also need to specify a set of try-out values for model tuning. For random forest, we primarily have to care about `mtry`, i.e. the number of features to sample at each split point.
+
+```{r}
+ncols <- ncol(model.matrix(inc ~ ., data = census_train))
+grid <- expand.grid(mtry = c(floor(sqrt(ncols))-1, 
+                              floor(sqrt(ncols)), 
+                              floor(sqrt(ncols))+1),
+                    splitrule = "gini",
+                    min.node.size = 10)
+grid
+```
+
+These objects can now be passed on to `train()`, along with the specification of the prediction method. For random forests, we use `ranger`.
+
+```{r}
+rf <- train(inc ~ ., 
+            data = census_train,
+            method = "ranger",
+            trControl = ctrl,
+            tuneGrid = grid)
+```
+
+Calling the random forest object lists the results of the tuning process.
+
+```{r}
+rf
+```
+
+With random forests, the individual trees of the ensemble typically look quite different. To get an idea of the components of the forest, `treeInfo()` can be used to print individual trees.
+
+```{r}
+treeInfo(rf$finalModel, tree = 1)[1:10,]
+treeInfo(rf$finalModel, tree = 2)[1:10,]
+```
+
+## Prediction and evaluation
+
+Finally, we can asses the performance of the trained model in the test data. For this, we first compute predicted probabilities.
+
+```{r}
+p_tree <- predict(tree3, newdata = census_test, type = "prob")
+p_rf <- predict(rf, newdata = census_test, type = "prob")
+```
+
+The `pROC` package can be used to calculate ROC-AUCs and plot ROC curves given a vector of predicted probabilities.
+
+```{r}
+tree_roc <- roc(census_test$inc, p_tree[,2])
+rf_roc <- roc(census_test$inc, p_rf$over_50K)
+tree_roc
+rf_roc
+```
+
+The `roc` objects can be plotted with `ggroc()`, which allows to use `ggplot2` syntax.
+
+```{r}
+ggroc(list(tree=tree_roc, random_forest=rf_roc)) +
+  geom_segment(aes(x = 1, xend = 0, y = 0, yend = 1), color = "grey", linetype = "dashed") + 
+  theme(legend.title = element_blank())
+```
